@@ -23,6 +23,9 @@ cors:
   enabled: true
   allowed_origins: ["*"]
 
+db:
+  url: sqlite3://C:/Users/gladd/AppData/Roaming/flipt/flipt.db
+
 # server:
 #   protocol: http
 #   host: 0.0.0.0
