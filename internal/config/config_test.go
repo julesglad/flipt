@@ -238,8 +238,8 @@ func TestLoad(t *testing.T) {
 			},
 		},
 		{
-			name: "deprecated tracing jaeger enabled",
-			path: "./testdata/deprecated/tracing_jaeger_enabled.yml",
+			name: "deprecated tracing jaeger",
+			path: "./testdata/deprecated/tracing_jaeger.yml",
 			expected: func() *Config {
 				cfg := Default()
 				cfg.Tracing.Enabled = true
@@ -247,14 +247,21 @@ func TestLoad(t *testing.T) {
 				return cfg
 			},
 			warnings: []string{
-				"\"tracing.jaeger.enabled\" is deprecated. Please use 'tracing.enabled' and 'tracing.exporter' instead.",
+				"\"tracing.exporter.jaeger\" is deprecated and will be removed in a future release.",
 			},
 		},
 		{
-			name:     "deprecated experimental filesystem_storage",
-			path:     "./testdata/deprecated/experimental_filesystem_storage.yml",
-			expected: Default,
-			warnings: []string{"\"experimental.filesystem_storage\" is deprecated. The experimental filesystem storage backend has graduated to a stable feature. Please use 'storage' instead."},
+			name: "deprecated autentication excluding metadata",
+			path: "./testdata/deprecated/authentication_excluding_metadata.yml",
+			expected: func() *Config {
+				cfg := Default()
+				cfg.Authentication.Required = true
+				cfg.Authentication.Exclude.Metadata = true
+				return cfg
+			},
+			warnings: []string{
+				"\"authentication.exclude.metadata\" is deprecated and will be removed in a future release. This feature never worked as intended. Metadata can no longer be excluded from authentication (when required).",
+			},
 		},
 		{
 			name: "cache no backend set",
@@ -479,6 +486,26 @@ func TestLoad(t *testing.T) {
 			name:    "authentication oidc missing client id",
 			path:    "./testdata/authentication/oidc_missing_redirect_address.yml",
 			wantErr: errors.New("provider \"foo\": field \"redirect_address\": non-empty value is required"),
+		},
+		{
+			name:    "authentication jwt public key file or jwks url required",
+			path:    "./testdata/authentication/jwt_missing_key_file_and_jwks_url.yml",
+			wantErr: errors.New("one of jwks_url or public_key_file is required"),
+		},
+		{
+			name:    "authentication jwt public key file and jwks url mutually exclusive",
+			path:    "./testdata/authentication/jwt_key_file_and_jwks_url.yml",
+			wantErr: errors.New("only one of jwks_url or public_key_file can be set"),
+		},
+		{
+			name:    "authentication jwks invalid url",
+			path:    "./testdata/authentication/jwt_invalid_jwks_url.yml",
+			wantErr: errors.New(`field "jwks_url": parse " http://localhost:8080/.well-known/jwks.json": first path segment in URL cannot contain colon`),
+		},
+		{
+			name:    "authentication jwt public key file not found",
+			path:    "./testdata/authentication/jwt_key_file_not_found.yml",
+			wantErr: errors.New(`field "public_key_file": stat testdata/authentication/jwt_key_file.pem: no such file or directory`),
 		},
 		{
 			name: "advanced",
@@ -846,6 +873,41 @@ func TestLoad(t *testing.T) {
 						},
 					},
 				}
+				return cfg
+			},
+		},
+		{
+			name:    "gs config invalid",
+			path:    "./testdata/storage/gs_invalid.yml",
+			wantErr: errors.New("googlecloud bucket must be specified"),
+		},
+		{
+			name: "gs full config provided",
+			path: "./testdata/storage/gs_full.yml",
+			expected: func() *Config {
+				cfg := Default()
+				cfg.Storage = StorageConfig{
+					Type: ObjectStorageType,
+					Object: &Object{
+						Type: GSBlobObjectSubStorageType,
+						GS: &GS{
+							Bucket:       "testdata",
+							Prefix:       "prefix",
+							PollInterval: 5 * time.Minute,
+						},
+					},
+				}
+				return cfg
+			},
+		},
+		{
+			name: "grpc keepalive config provided",
+			path: "./testdata/server/grpc_keepalive.yml",
+			expected: func() *Config {
+				cfg := Default()
+				cfg.Server.GRPCConnectionMaxIdleTime = 1 * time.Hour
+				cfg.Server.GRPCConnectionMaxAge = 30 * time.Second
+				cfg.Server.GRPCConnectionMaxAgeGrace = 10 * time.Second
 				return cfg
 			},
 		},

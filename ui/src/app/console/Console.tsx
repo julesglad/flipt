@@ -1,9 +1,9 @@
+import { json } from '@codemirror/lang-json';
 import { ArrowPathIcon } from '@heroicons/react/20/solid';
+import { tokyoNight } from '@uiw/codemirror-theme-tokyo-night';
+import CodeMirror from '@uiw/react-codemirror';
 import { Form, Formik, useFormikContext } from 'formik';
-import hljs from 'highlight.js';
-import javascript from 'highlight.js/lib/languages/json';
-import 'highlight.js/styles/tomorrow-night-bright.css';
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { useSelector } from 'react-redux';
 import { useNavigate } from 'react-router-dom';
 import { v4 as uuidv4 } from 'uuid';
@@ -20,7 +20,7 @@ import { evaluateURL, evaluateV2 } from '~/data/api';
 import { useError } from '~/data/hooks/error';
 import { useSuccess } from '~/data/hooks/success';
 import {
-  jsonValidation,
+  contextValidation,
   keyValidation,
   requiredValidation
 } from '~/data/validations';
@@ -32,8 +32,7 @@ import {
   generateCurlCommand,
   getErrorMessage
 } from '~/utils/helpers';
-
-hljs.registerLanguage('json', javascript);
+import { selectCurrentRef } from '~/app/refs/refsSlice';
 
 function ResetOnNamespaceChange({ namespace }: { namespace: INamespace }) {
   const { resetForm } = useFormikContext();
@@ -44,6 +43,12 @@ function ResetOnNamespaceChange({ namespace }: { namespace: INamespace }) {
 
   return null;
 }
+
+const consoleValidationSchema = Yup.object({
+  flagKey: keyValidation,
+  entityId: requiredValidation,
+  context: contextValidation
+});
 
 interface ConsoleFormValues {
   flagKey: string;
@@ -61,9 +66,7 @@ export default function Console() {
   const { setSuccess } = useSuccess();
 
   const namespace = useSelector(selectCurrentNamespace);
-
-  const codeRef = useRef<HTMLElement>(null);
-
+  const ref = useSelector(selectCurrentRef);
   const { data, error } = useListFlagsQuery(namespace.key);
 
   useEffect(() => {
@@ -119,7 +122,7 @@ export default function Console() {
       context: parsed
     };
 
-    evaluateV2(namespace.key, flag.key, flag.type, rest)
+    evaluateV2(ref, namespace.key, flag.key, flag.type, rest)
       .then((resp) => {
         setHasEvaluationError(false);
         setResponse(JSON.stringify(resp, null, 2));
@@ -168,15 +171,6 @@ export default function Console() {
     setSuccess('Command copied to clipboard');
   };
 
-  useEffect(() => {
-    if (codeRef.current) {
-      // must unset property 'highlighted' so that it can be highlighted again
-      // otherwise it gets highlighted the first time only
-      delete codeRef.current.dataset.highlighted;
-    }
-    hljs.highlightAll();
-  }, [response, codeRef]);
-
   const initialvalues: ConsoleFormValues = {
     flagKey: selectedFlag?.key || '',
     entityId: uuidv4(),
@@ -199,11 +193,7 @@ export default function Console() {
             <div className="mt-8 w-full overflow-hidden md:w-1/2">
               <Formik
                 initialValues={initialvalues}
-                validationSchema={Yup.object({
-                  flagKey: keyValidation,
-                  entityId: requiredValidation,
-                  context: jsonValidation
-                })}
+                validationSchema={consoleValidationSchema}
                 onSubmit={(values) => {
                   handleSubmit(selectedFlag, values);
                 }}
@@ -263,7 +253,7 @@ export default function Console() {
                           >
                             Request Context
                           </label>
-                          <div className="nightwind-prevent mt-1">
+                          <div className="nightwind-prevent mt-1 text-sm">
                             <ContextEditor
                               id="context"
                               setValue={(v) => {
@@ -301,16 +291,22 @@ export default function Console() {
             </div>
             <div className="mt-8 w-full overflow-hidden md:w-1/2 md:pl-4">
               {response && (
-                <pre className="p-2 text-sm md:h-full">
+                <pre className="nightwind-prevent bg-[#1a1b26] p-2 text-sm md:h-full">
                   {hasEvaluationError ? (
-                    <p className="border-red-400 border-4">{response}</p>
+                    <p className="text-red-400">{response}</p>
                   ) : (
-                    <code
-                      className="hljs json rounded-sm md:h-full"
-                      ref={codeRef}
-                    >
-                      {response as React.ReactNode}
-                    </code>
+                    <CodeMirror
+                      value={response}
+                      height="100%"
+                      extensions={[json()]}
+                      basicSetup={{
+                        lineNumbers: false,
+                        foldGutter: false,
+                        highlightActiveLine: false
+                      }}
+                      editable={false}
+                      theme={tokyoNight}
+                    />
                   )}
                 </pre>
               )}

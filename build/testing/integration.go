@@ -1,22 +1,48 @@
 package testing
 
 import (
+	"bytes"
 	"context"
+	"crypto"
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/pem"
 	"errors"
 	"fmt"
 	"log"
+	"math/big"
 	"os"
 	"path"
 	"strings"
+	"time"
 
 	"dagger.io/dagger"
 	"github.com/containerd/containerd/platforms"
+	"github.com/go-jose/go-jose/v3"
+	jjwt "github.com/go-jose/go-jose/v3/jwt"
 	"github.com/google/go-cmp/cmp"
 	"github.com/google/uuid"
+	"github.com/hashicorp/cap/jwt"
+	"go.flipt.io/stew/config"
 	"golang.org/x/sync/errgroup"
+	"gopkg.in/yaml.v3"
 )
 
 const bootstrapToken = "s3cr3t"
+
+var priv *rsa.PrivateKey
+
+func init() {
+	// Generate a key to sign JWTs with throughout most test cases.
+	// It can be slow sometimes to generate a 4096-bit RSA key, so we only do it once.
+	var err error
+	priv, err = rsa.GenerateKey(rand.Reader, 4096)
+	if err != nil {
+		panic(err)
+	}
+}
 
 var (
 	protocolPorts = map[string]int{"http": 8080, "grpc": 9000}
@@ -36,16 +62,18 @@ var (
 		"fs/s3":         s3,
 		"fs/oci":        oci,
 		"fs/azblob":     azblob,
+		"fs/gcs":        gcs,
 		"import/export": importExport,
 	}
 )
 
 type testConfig struct {
-	name      string
-	namespace string
-	address   string
-	auth      authConfig
-	port      int
+	name       string
+	namespace  string
+	address    string
+	auth       authConfig
+	port       int
+	references bool
 }
 
 type testCaseFn func(_ context.Context, client *dagger.Client, base, flipt *dagger.Container, conf testConfig) func() error
@@ -71,12 +99,27 @@ type authConfig int
 
 const (
 	noAuth authConfig = iota
-	authNoNamespace
-	authNamespaced
+	staticAuth
+	staticAuthNamespaced
+	jwtAuth
+	k8sAuth
 )
 
 func (a authConfig) enabled() bool {
 	return a != noAuth
+}
+
+func (a authConfig) method() string {
+	switch a {
+	case staticAuth, staticAuthNamespaced:
+		return "static"
+	case jwtAuth:
+		return "jwt"
+	case k8sAuth:
+		return "k8s"
+	default:
+		return ""
+	}
 }
 
 func Integration(ctx context.Context, client *dagger.Client, base, flipt *dagger.Container, caseNames ...string) error {
@@ -98,7 +141,8 @@ func Integration(ctx context.Context, client *dagger.Client, base, flipt *dagger
 
 	for _, namespace := range []string{"", "production"} {
 		for protocol, port := range protocolPorts {
-			for _, auth := range []authConfig{noAuth, authNoNamespace, authNamespaced} {
+			for _, auth := range []authConfig{noAuth, staticAuth, staticAuthNamespaced, jwtAuth, k8sAuth} {
+				auth := auth
 				config := testConfig{
 					name:      fmt.Sprintf("%s namespace %s", strings.ToUpper(protocol), namespace),
 					namespace: namespace,
@@ -110,10 +154,14 @@ func Integration(ctx context.Context, client *dagger.Client, base, flipt *dagger
 				switch auth {
 				case noAuth:
 					config.name = fmt.Sprintf("%s without auth", config.name)
-				case authNoNamespace:
-					config.name = fmt.Sprintf("%s with auth no namespaced token", config.name)
-				case authNamespaced:
-					config.name = fmt.Sprintf("%s with auth namespaced token", config.name)
+				case staticAuth:
+					config.name = fmt.Sprintf("%s with static auth token", config.name)
+				case staticAuthNamespaced:
+					config.name = fmt.Sprintf("%s with static auth namespaced token", config.name)
+				case jwtAuth:
+					config.name = fmt.Sprintf("%s with jwt auth", config.name)
+				case k8sAuth:
+					config.name = fmt.Sprintf("%s with k8s auth", config.name)
 				}
 
 				configs = append(configs, config)
@@ -128,25 +176,62 @@ func Integration(ctx context.Context, client *dagger.Client, base, flipt *dagger
 			var (
 				fn     = fn
 				config = config
+				flipt  = flipt
+				base   = base
 			)
 
-			flipt := flipt
-			if config.auth.enabled() {
+			g.Go(take(func() error {
+				if config.auth.enabled() {
+					flipt = flipt.
+						WithEnvVariable("FLIPT_AUTHENTICATION_REQUIRED", "true").
+						WithEnvVariable("FLIPT_AUTHENTICATION_METHODS_TOKEN_ENABLED", "true").
+						WithEnvVariable("FLIPT_AUTHENTICATION_METHODS_TOKEN_BOOTSTRAP_TOKEN", bootstrapToken)
+
+					switch config.auth {
+					case k8sAuth:
+						flipt = flipt.
+							WithEnvVariable("FLIPT_AUTHENTICATION_METHODS_KUBERNETES_ENABLED", "true")
+
+						var saToken string
+						// run an OIDC server which exposes a JWKS url using a private key we own
+						// and generate a JWT to act as our SA token
+						flipt, saToken, err = serveOIDC(ctx, client, base, flipt)
+						if err != nil {
+							return err
+						}
+
+						// mount service account token into base on expected k8s sa token path
+						base = base.WithNewFile("/var/run/secrets/kubernetes.io/serviceaccount/token", dagger.ContainerWithNewFileOpts{
+							Contents: saToken,
+						})
+					case jwtAuth:
+						bytes, err := x509.MarshalPKIXPublicKey(priv.Public())
+						if err != nil {
+							return err
+						}
+
+						bytes = pem.EncodeToMemory(&pem.Block{
+							Type:  "public key",
+							Bytes: bytes,
+						})
+
+						flipt = flipt.
+							WithEnvVariable("FLIPT_AUTHENTICATION_METHODS_JWT_ENABLED", "true").
+							WithNewFile("/etc/flipt/jwt.pem", dagger.ContainerWithNewFileOpts{Contents: string(bytes)}).
+							WithEnvVariable("FLIPT_AUTHENTICATION_METHODS_JWT_PUBLIC_KEY_FILE", "/etc/flipt/jwt.pem").
+							WithEnvVariable("FLIPT_AUTHENTICATION_METHODS_JWT_VALIDATE_CLAIMS_ISSUER", "https://flipt.io")
+					}
+				}
+
+				name := strings.ToLower(replacer.Replace(fmt.Sprintf("flipt-test-%s-config-%s", caseName, config.name)))
 				flipt = flipt.
-					WithEnvVariable("FLIPT_AUTHENTICATION_REQUIRED", "true").
-					WithEnvVariable("FLIPT_AUTHENTICATION_METHODS_TOKEN_ENABLED", "true").
-					WithEnvVariable("FLIPT_AUTHENTICATION_METHODS_TOKEN_BOOTSTRAP_TOKEN", bootstrapToken)
-			}
-
-			name := strings.ToLower(replacer.Replace(fmt.Sprintf("flipt-test-%s-config-%s", caseName, config.name)))
-			flipt = flipt.
-				WithEnvVariable("CI", os.Getenv("CI")).
-				WithEnvVariable("FLIPT_LOG_LEVEL", "debug").
-				WithEnvVariable("FLIPT_LOG_FILE", fmt.Sprintf("/var/opt/flipt/logs/%s.log", name)).
-				WithMountedCache("/var/opt/flipt/logs", logs).
-				WithExposedPort(config.port)
-
-			g.Go(take(fn(ctx, client, base.Pipeline(name), flipt, config)))
+					WithEnvVariable("CI", os.Getenv("CI")).
+					WithEnvVariable("FLIPT_LOG_LEVEL", "debug").
+					WithEnvVariable("FLIPT_LOG_FILE", fmt.Sprintf("/var/opt/flipt/logs/%s.log", name)).
+					WithMountedCache("/var/opt/flipt/logs", logs).
+					WithExposedPort(config.port)
+				return fn(ctx, client, base.Pipeline(name), flipt, config)()
+			}))
 		}
 	}
 
@@ -254,13 +339,13 @@ func cache(ctx context.Context, _ *dagger.Client, base, flipt *dagger.Container,
 }
 
 const (
-	testdataDir     = "build/testing/integration/readonly/testdata"
-	testdataPathFmt = testdataDir + "/%s.yaml"
+	rootTestdataDir           = "build/testing/integration/readonly/testdata"
+	singleRevisionTestdataDir = rootTestdataDir + "/main"
 )
 
 func local(ctx context.Context, client *dagger.Client, base, flipt *dagger.Container, conf testConfig) func() error {
 	flipt = flipt.
-		WithDirectory("/tmp/testdata", base.Directory(testdataDir)).
+		WithDirectory("/tmp/testdata", base.Directory(singleRevisionTestdataDir)).
 		WithEnvVariable("FLIPT_LOG_LEVEL", "DEBUG").
 		WithEnvVariable("FLIPT_STORAGE_TYPE", "local").
 		WithEnvVariable("FLIPT_STORAGE_LOCAL_PATH", "/tmp/testdata").
@@ -275,9 +360,50 @@ func git(ctx context.Context, client *dagger.Client, base, flipt *dagger.Contain
 		WithExposedPort(3000).
 		WithExec(nil)
 
-	_, err := base.
+	stew := config.Config{
+		URL: "http://gitea:3000",
+		Admin: struct {
+			Username string "json:\"username\""
+			Email    string "json:\"email\""
+			Password string "json:\"password\""
+		}{
+			Username: "root",
+			Password: "password",
+			Email:    "dev@flipt.io",
+		},
+		Repositories: []config.Repository{
+			{
+				Name: "features",
+				Contents: []config.Content{
+					{
+						Branch:  "main",
+						Path:    "/work/base/main",
+						Message: "feat: add main directory contents",
+					},
+					{
+						Branch:  "alternate",
+						Path:    "/work/base/alternate",
+						Message: "feat: add alternate directory contents",
+					},
+				},
+			},
+		},
+	}
+
+	contents, err := yaml.Marshal(&stew)
+	if err != nil {
+		return func() error { return err }
+	}
+
+	_, err = client.Container().
+		From("ghcr.io/flipt-io/stew:latest").
+		WithWorkdir("/work").
+		WithDirectory("/work/base", base.Directory(rootTestdataDir)).
+		WithNewFile("/etc/stew/config.yml", dagger.ContainerWithNewFileOpts{
+			Contents: string(contents),
+		}).
 		WithServiceBinding("gitea", gitea.AsService()).
-		WithExec([]string{"go", "run", "./build/internal/cmd/gitea/...", "-gitea-url", "http://gitea:3000", "-testdata-dir", testdataDir}).
+		WithExec(nil).
 		Sync(ctx)
 	if err != nil {
 		return func() error { return err }
@@ -288,7 +414,12 @@ func git(ctx context.Context, client *dagger.Client, base, flipt *dagger.Contain
 		WithEnvVariable("FLIPT_LOG_LEVEL", "DEBUG").
 		WithEnvVariable("FLIPT_STORAGE_TYPE", "git").
 		WithEnvVariable("FLIPT_STORAGE_GIT_REPOSITORY", "http://gitea:3000/root/features.git").
+		WithEnvVariable("FLIPT_STORAGE_GIT_AUTHENTICATION_BASIC_USERNAME", "root").
+		WithEnvVariable("FLIPT_STORAGE_GIT_AUTHENTICATION_BASIC_PASSWORD", "password").
 		WithEnvVariable("UNIQUE", uuid.New().String())
+
+	// Git backend supports arbitrary references
+	conf.references = true
 
 	return suite(ctx, "readonly", base, flipt.WithExec(nil), conf)
 }
@@ -296,24 +427,26 @@ func git(ctx context.Context, client *dagger.Client, base, flipt *dagger.Contain
 func s3(ctx context.Context, client *dagger.Client, base, flipt *dagger.Container, conf testConfig) func() error {
 	minio := client.Container().
 		From("quay.io/minio/minio:latest").
+		WithEnvVariable("UNIQUE", uuid.New().String()).
 		WithExposedPort(9009).
 		WithEnvVariable("MINIO_ROOT_USER", "user").
 		WithEnvVariable("MINIO_ROOT_PASSWORD", "password").
 		WithEnvVariable("MINIO_BROWSER", "off").
-		WithExec([]string{"server", "/data", "--address", ":9009", "--quiet"})
+		WithExec([]string{"server", "/data", "--address", ":9009", "--quiet"}).
+		AsService()
 
 	_, err := base.
-		WithServiceBinding("minio", minio.AsService()).
+		WithServiceBinding("minio", minio).
 		WithEnvVariable("AWS_ACCESS_KEY_ID", "user").
 		WithEnvVariable("AWS_SECRET_ACCESS_KEY", "password").
-		WithExec([]string{"go", "run", "./build/internal/cmd/minio/...", "-minio-url", "http://minio:9009", "-testdata-dir", testdataDir}).
+		WithExec([]string{"go", "run", "./build/internal/cmd/minio/...", "-minio-url", "http://minio:9009", "-testdata-dir", singleRevisionTestdataDir}).
 		Sync(ctx)
 	if err != nil {
 		return func() error { return err }
 	}
 
 	flipt = flipt.
-		WithServiceBinding("minio", minio.AsService()).
+		WithServiceBinding("minio", minio).
 		WithEnvVariable("FLIPT_LOG_LEVEL", "DEBUG").
 		WithEnvVariable("AWS_ACCESS_KEY_ID", "user").
 		WithEnvVariable("AWS_SECRET_ACCESS_KEY", "password").
@@ -363,7 +496,7 @@ func oci(ctx context.Context, client *dagger.Client, base, flipt *dagger.Contain
 		WithNewFile("/etc/zot/config.json", dagger.ContainerWithNewFileOpts{Contents: zotConfig})
 
 	if _, err := flipt.
-		WithDirectory("/tmp/testdata", base.Directory(testdataDir)).
+		WithDirectory("/tmp/testdata", base.Directory(singleRevisionTestdataDir)).
 		WithWorkdir("/tmp/testdata").
 		WithServiceBinding("zot", zot.AsService()).
 		WithEnvVariable("FLIPT_STORAGE_OCI_AUTHENTICATION_USERNAME", "username").
@@ -401,7 +534,7 @@ func importExport(ctx context.Context, _ *dagger.Client, base, flipt *dagger.Con
 			ns = conf.namespace
 		}
 
-		seed := base.File(fmt.Sprintf(testdataPathFmt, ns))
+		seed := base.File(path.Join(singleRevisionTestdataDir, ns+".yaml"))
 
 		var (
 			// create unique instance for test case
@@ -480,10 +613,33 @@ func suite(ctx context.Context, dir string, base, flipt *dagger.Container, conf 
 			flags = append(flags, "--flipt-namespace", conf.namespace)
 		}
 
+		if conf.references {
+			flags = append(flags, "--flipt-supports-references")
+		}
+
 		if conf.auth.enabled() {
-			flags = append(flags, "--flipt-token", bootstrapToken)
-			if conf.auth == authNamespaced {
-				flags = append(flags, "--flipt-create-namespaced-token")
+			flags = append(flags, "--flipt-token-type", conf.auth.method())
+
+			switch conf.auth.method() {
+			case "static":
+				flags = append(flags, "--flipt-token", bootstrapToken)
+				if conf.auth == staticAuthNamespaced {
+					flags = append(flags, "--flipt-create-namespaced-token")
+				}
+			case "jwt":
+				var (
+					now        = time.Now()
+					nowUnix    = float64(now.Unix())
+					futureUnix = float64(now.Add(2 * jjwt.DefaultLeeway).Unix())
+				)
+
+				token := signJWT(priv, map[string]interface{}{
+					"iss": "https://flipt.io",
+					"iat": nowUnix,
+					"exp": futureUnix,
+				})
+
+				flags = append(flags, "--flipt-token", token)
 			}
 		}
 
@@ -502,6 +658,7 @@ func suite(ctx context.Context, dir string, base, flipt *dagger.Container, conf 
 func azblob(ctx context.Context, client *dagger.Client, base, flipt *dagger.Container, conf testConfig) func() error {
 	azurite := client.Container().
 		From("mcr.microsoft.com/azure-storage/azurite").
+		WithEnvVariable("UNIQUE", uuid.New().String()).
 		WithExposedPort(10000).
 		WithExec([]string{"azurite-blob", "--blobHost", "0.0.0.0", "--silent"}).
 		AsService()
@@ -510,7 +667,7 @@ func azblob(ctx context.Context, client *dagger.Client, base, flipt *dagger.Cont
 		WithServiceBinding("azurite", azurite).
 		WithEnvVariable("AZURE_STORAGE_ACCOUNT", "devstoreaccount1").
 		WithEnvVariable("AZURE_STORAGE_KEY", "Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==").
-		WithExec([]string{"go", "run", "./build/internal/cmd/azurite/...", "-url", "http://azurite:10000/devstoreaccount1", "-testdata-dir", testdataDir}).
+		WithExec([]string{"go", "run", "./build/internal/cmd/azurite/...", "-url", "http://azurite:10000/devstoreaccount1", "-testdata-dir", singleRevisionTestdataDir}).
 		Sync(ctx)
 	if err != nil {
 		return func() error { return err }
@@ -528,4 +685,175 @@ func azblob(ctx context.Context, client *dagger.Client, base, flipt *dagger.Cont
 		WithEnvVariable("UNIQUE", uuid.New().String())
 
 	return suite(ctx, "readonly", base, flipt.WithExec(nil), conf)
+}
+
+// gcs simulates the Google Cloud Storage service
+func gcs(ctx context.Context, client *dagger.Client, base, flipt *dagger.Container, conf testConfig) func() error {
+	gcs := client.Container().
+		From("fsouza/fake-gcs-server").
+		WithEnvVariable("UNIQUE", uuid.New().String()).
+		WithExposedPort(4443).
+		WithExec([]string{"-scheme", "http", "-public-host", "gcs:4443"}).
+		AsService()
+
+	_, err := base.
+		WithServiceBinding("gcs", gcs).
+		WithEnvVariable("STORAGE_EMULATOR_HOST", "gcs:4443").
+		WithExec([]string{"go", "run", "./build/internal/cmd/gcs/...", "-testdata-dir", singleRevisionTestdataDir}).
+		Sync(ctx)
+	if err != nil {
+		return func() error { return err }
+	}
+
+	flipt = flipt.
+		WithServiceBinding("gcs", gcs).
+		WithEnvVariable("FLIPT_LOG_LEVEL", "DEBUG").
+		WithEnvVariable("FLIPT_STORAGE_TYPE", "object").
+		WithEnvVariable("FLIPT_STORAGE_OBJECT_TYPE", "googlecloud").
+		WithEnvVariable("FLIPT_STORAGE_OBJECT_GOOGLECLOUD_BUCKET", "testdata").
+		WithEnvVariable("STORAGE_EMULATOR_HOST", "gcs:4443").
+		WithEnvVariable("UNIQUE", uuid.New().String())
+
+	return suite(ctx, "readonly", base, flipt.WithExec(nil), conf)
+}
+
+func signJWT(key crypto.PrivateKey, claims interface{}) string {
+	sig, err := jose.NewSigner(
+		jose.SigningKey{Algorithm: jose.SignatureAlgorithm(string(jwt.RS256)), Key: key},
+		(&jose.SignerOptions{}).WithType("JWT"),
+	)
+
+	raw, err := jjwt.Signed(sig).
+		Claims(claims).
+		CompactSerialize()
+	if err != nil {
+		panic(err)
+	}
+
+	return raw
+}
+
+// serveOIDC runs a mini OIDC-style key provider and mounts it as a service onto Flipt.
+// This provider is designed to mimic how kubernetes exposes JWKS endpoints for its service account tokens.
+// The function creates signing keys and TLS CA certificates which is shares with the provider and
+// with Flipt itself. This is to facilitate Flipt using the custom CA to authenticate the provider.
+// The function generates two JWTs, one for Flipt to identify itself and one which is returned to the caller.
+// The caller can use this as the service account token identity to be mounted into the container with the
+// client used for running the test and authenticating with Flipt.
+func serveOIDC(ctx context.Context, client *dagger.Client, base, flipt *dagger.Container) (*dagger.Container, string, error) {
+	priv, err := rsa.GenerateKey(rand.Reader, 4096)
+	if err != nil {
+		return nil, "", err
+	}
+
+	rsaSigningKey := &bytes.Buffer{}
+	if err := pem.Encode(rsaSigningKey, &pem.Block{
+		Type:  "RSA PRIVATE KEY",
+		Bytes: x509.MarshalPKCS1PrivateKey(priv),
+	}); err != nil {
+		return nil, "", err
+	}
+
+	// generate a SA style JWT for identifying the Flipt service
+	fliptSAToken := signJWT(priv, map[string]any{
+		"exp": time.Now().Add(24 * time.Hour).Unix(),
+		"iss": "https://discover.srv",
+		"kubernetes.io": map[string]any{
+			"namespace": "flipt",
+			"pod": map[string]any{
+				"name": "flipt-7d26f049-kdurb",
+				"uid":  "bd8299f9-c50f-4b76-af33-9d8e3ef2b850",
+			},
+			"serviceaccount": map[string]any{
+				"name": "flipt",
+				"uid":  "4f18914e-f276-44b2-aebd-27db1d8f8def",
+			},
+		},
+	})
+
+	// generate a CA certificate to share between Flipt and the mini OIDC server
+	ca := &x509.Certificate{
+		SerialNumber: big.NewInt(2019),
+		Subject: pkix.Name{
+			Organization:  []string{"Flipt, INC."},
+			Country:       []string{"US"},
+			Province:      []string{""},
+			Locality:      []string{"North Carolina"},
+			StreetAddress: []string{""},
+			PostalCode:    []string{""},
+		},
+		NotBefore:             time.Now(),
+		NotAfter:              time.Now().AddDate(10, 0, 0),
+		IsCA:                  true,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth, x509.ExtKeyUsageServerAuth},
+		KeyUsage:              x509.KeyUsageDigitalSignature | x509.KeyUsageCertSign,
+		BasicConstraintsValid: true,
+		DNSNames:              []string{"discover.svc"},
+	}
+
+	caPrivKey, err := rsa.GenerateKey(rand.Reader, 4096)
+	if err != nil {
+		return nil, "", err
+	}
+
+	caBytes, err := x509.CreateCertificate(rand.Reader, ca, ca, &caPrivKey.PublicKey, caPrivKey)
+	if err != nil {
+		return nil, "", err
+	}
+
+	var caCert bytes.Buffer
+	if err := pem.Encode(&caCert, &pem.Block{
+		Type:  "CERTIFICATE",
+		Bytes: caBytes,
+	}); err != nil {
+		return nil, "", err
+	}
+
+	var caPrivKeyPEM bytes.Buffer
+	pem.Encode(&caPrivKeyPEM, &pem.Block{
+		Type:  "RSA PRIVATE KEY",
+		Bytes: x509.MarshalPKCS1PrivateKey(caPrivKey),
+	})
+
+	return flipt.
+			WithEnvVariable("FLIPT_LOG_LEVEL", "debug").
+			WithEnvVariable("FLIPT_AUTHENTICATION_METHODS_KUBERNETES_DISCOVERY_URL", "https://discover.svc").
+			WithServiceBinding("discover.svc", base.
+				WithNewFile("/server.crt", dagger.ContainerWithNewFileOpts{
+					Contents: caCert.String(),
+				}).
+				WithNewFile("/server.key", dagger.ContainerWithNewFileOpts{
+					Contents: caPrivKeyPEM.String(),
+				}).
+				WithNewFile("/priv.pem", dagger.ContainerWithNewFileOpts{
+					Contents: rsaSigningKey.String(),
+				}).
+				WithExposedPort(443).
+				WithExec([]string{
+					"sh",
+					"-c",
+					"go run ./build/internal/cmd/discover/... --private-key /priv.pem",
+				}).
+				AsService()).
+			WithNewFile("/var/run/secrets/kubernetes.io/serviceaccount/token",
+				dagger.ContainerWithNewFileOpts{Contents: fliptSAToken}).
+			WithNewFile("/var/run/secrets/kubernetes.io/serviceaccount/ca.crt",
+				dagger.ContainerWithNewFileOpts{Contents: caCert.String()}),
+		// generate a JWT to used to identify the workload communicating with Flipt
+		// using the private key components of the key pair served by the OIDC server
+		signJWT(priv, map[string]any{
+			"exp": time.Now().Add(24 * time.Hour).Unix(),
+			"iss": "https://discover.svc",
+			"kubernetes.io": map[string]any{
+				"namespace": "integration",
+				"pod": map[string]any{
+					"name": "integration-test-7d26f049-kdurb",
+					"uid":  "bd8299f9-c50f-4b76-af33-9d8e3ef2b850",
+				},
+				"serviceaccount": map[string]any{
+					"name": "integration-test",
+					"uid":  "4f18914e-f276-44b2-aebd-27db1d8f8def",
+				},
+			},
+		}), nil
 }

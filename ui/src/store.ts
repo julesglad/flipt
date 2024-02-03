@@ -7,23 +7,23 @@ import {
 import { authProvidersApi } from '~/app/auth/authApi';
 import {
   namespaceApi,
+  namespaceKey,
   namespacesSlice
 } from '~/app/namespaces/namespacesSlice';
 import { flagsApi } from './app/flags/flagsApi';
-import { rolloutsApi } from './app/flags/rolloutsApi';
-import { rulesApi } from './app/flags/rulesApi';
+import { rolloutTag, rolloutsApi } from './app/flags/rolloutsApi';
+import { ruleTag, rulesApi } from './app/flags/rulesApi';
 import { metaSlice } from './app/meta/metaSlice';
 import {
   preferencesKey,
   preferencesSlice
 } from './app/preferences/preferencesSlice';
-import { segmentsApi } from './app/segments/segmentsApi';
+import { segmentTag, segmentsApi } from './app/segments/segmentsApi';
 import { tokensApi } from './app/tokens/tokensApi';
 import { LoadingStatus } from './types/Meta';
+import { refsKey, refsSlice } from './app/refs/refsSlice';
 
 const listenerMiddleware = createListenerMiddleware();
-
-const namespaceKey = 'namespace';
 
 listenerMiddleware.startListening({
   matcher: isAnyOf(
@@ -49,6 +49,25 @@ listenerMiddleware.startListening({
     );
   }
 });
+
+listenerMiddleware.startListening({
+  matcher: isAnyOf(refsSlice.actions.currentRefChanged),
+  effect: (_action, api) => {
+    // save to local storage
+    localStorage.setItem(
+      refsKey,
+      (api.getState() as RootState).refs.currentRef || ''
+    );
+
+    // reset internal cache
+    api.dispatch(namespaceApi.util.resetApiState());
+    api.dispatch(flagsApi.util.resetApiState());
+    api.dispatch(segmentsApi.util.resetApiState());
+    api.dispatch(rolloutsApi.util.resetApiState());
+    api.dispatch(rulesApi.util.resetApiState());
+  }
+});
+
 /*
  * It could be anti-pattern but it feels like the right thing to do.
  * The namespacesSlice holds the namespaces globally and doesn't refetch them
@@ -63,14 +82,41 @@ listenerMiddleware.startListening({
   }
 });
 
+// clean segments cache for deleted namespace
+listenerMiddleware.startListening({
+  matcher: namespaceApi.endpoints.deleteNamespace.matchFulfilled,
+  effect: (action, api) => {
+    api.dispatch(
+      segmentsApi.util.invalidateTags([
+        segmentTag(action.meta.arg.originalArgs)
+      ])
+    );
+  }
+});
+
+// clean rollouts and rules cache for deleted flag
+listenerMiddleware.startListening({
+  matcher: flagsApi.endpoints.deleteFlag.matchFulfilled,
+  effect: (action, api) => {
+    const arg = action.meta.arg.originalArgs;
+    api.dispatch(rolloutsApi.util.invalidateTags([rolloutTag(arg)]));
+    api.dispatch(rulesApi.util.invalidateTags([ruleTag(arg)]));
+  }
+});
+
 const preferencesState = JSON.parse(
   localStorage.getItem(preferencesKey) || '{}'
 );
+
+const currentRef = localStorage.getItem(refsKey) || undefined;
 
 const currentNamespace = localStorage.getItem(namespaceKey) || 'default';
 
 export const store = configureStore({
   preloadedState: {
+    refs: {
+      currentRef
+    },
     preferences: preferencesState,
     namespaces: {
       namespaces: {},
@@ -80,6 +126,7 @@ export const store = configureStore({
     }
   },
   reducer: {
+    refs: refsSlice.reducer,
     namespaces: namespacesSlice.reducer,
     preferences: preferencesSlice.reducer,
     meta: metaSlice.reducer,
